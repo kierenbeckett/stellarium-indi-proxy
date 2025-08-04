@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import sys
+
+import xml.etree.ElementTree as ET
+
+from datetime import datetime, timezone
+
+indi_state = {}
+
+def indi_set_bool(name, attr, value):
+    indi_state['writer'].write(f"""
+        <newSwitchVector device="{args.mount}" name="{name}">
+            <oneSwitch name="{attr}">{'On' if value else 'Off'}</oneSwitch>
+        </newSwitchVector>
+    """.encode('ascii'))
+
+def coords_to_decimal(hex):
+    # the synscan protocol doesn't specify j2000, stellarium gives jnow
+    ra = 24 * int(hex[0:8], 16) / 2**32
+    # the synscan protocol allows this to be between 0-360, stellarium always gives a value between 0-90
+    dec = 360 * int(hex[9:17], 16) / 2**32
+    return ra, dec
+
+
+def coords_to_hex(ra, dec):
+    ra = bytes(hex(int(2**32 * ra / 24))[2:].upper(), 'ascii')
+    dec = bytes(hex(int(2**32 * dec / 360))[2:].upper(), 'ascii')
+    return ra + b',' + dec
+
+
+def loc_to_decimal(hex):
+    lat = (hex[0] +  hex[1] / 60 + hex[2] / 60 / 60) * (1 if hex[3] == 0 else -1)
+    long = (hex[4] +  hex[5] / 60 + hex[6] / 60 / 60)
+
+    if hex[7] != 0:
+        long = 360 - long
+
+    return lat, long
+
+
+def loc_to_hex(lat, long):
+    ew = 0 # east
+    if long > 180:
+        ew = 1 # west
+        long = 360 - long
+
+    return bytes([
+        int(abs(lat)),                   # lat hours
+        int(abs(lat) % 1 * 60),          # lat minutes
+        int(abs(lat) % 1 * 60 % 1 * 60), # lat seconds
+        0 if lat > 0 else 1,             # 0=north, 1=south
+        int(long),                       # long hours
+        int(long % 1 * 60),              # long minutes
+        int(long % 1 * 60 % 1 * 60),     # long seconds
+        ew
+    ])
+
+
+async def indi_connect():
+    while True:
+        writer = None
+        try:
+            print(f'Connecting to INDI at {args.indi_host}:{args.indi_port}...')
+            reader, writer = await asyncio.open_connection(args.indi_host, args.indi_port)
+            print(f'Connected to INDI, getting properties for {args.mount}')
+            indi_state['writer'] = writer
+            writer.write(f'<getProperties version="1.7" device="{args.mount}" />'.encode('ascii'))
+
+            parser = ET.XMLPullParser(events=['start', 'end'])
+            root_element = None
+
+            while True:
+                data = await reader.readline()
+                if not data:
+                    print('Disconnected from INDI')
+                    break
+
+                parser.feed(data)
+
+                for event, elem in parser.read_events():
+                    if root_element == None and event == 'start':
+                        root_element = elem.tag
+                    elif elem.tag == root_element and event == 'end':
+                        if elem.tag == 'defNumberVector' or elem.tag == 'setNumberVector':
+                            if elem.get('name') == 'EQUATORIAL_EOD_COORD':
+                                indi_state['doing_goto'] = elem.get('state')
+                                res = {n.get('name'): float(n.text) for n in elem.findall('defNumber') + elem.findall('oneNumber')}
+                                indi_state['ra'] = res['RA']
+                                indi_state['dec'] = res['DEC']
+                            elif elem.get('name') == 'GEOGRAPHIC_COORD':
+                                res = {n.get('name'): float(n.text) for n in elem.findall('defNumber') + elem.findall('oneNumber')}
+                                indi_state['lat'] = res['LAT']
+                                indi_state['long'] = res['LONG']
+                        elif elem.tag == 'defSwitchVector' or elem.tag == 'setSwitchVector':
+                            if elem.get('name') == 'TELESCOPE_TRACK_STATE':
+                                indi_state['tracking'] = elem.get('state')
+                        parser = ET.XMLPullParser(events=['start', 'end'])
+                        root_element = None
+        except Exception as e:
+            print(f'Error with INDI connection "{e}"')
+        finally:
+            if writer is not None:
+                writer.close()
+
+        print('Reconnecting to INDI in 60 seconds')
+        indi_state.clear()
+        await asyncio.sleep(60)
+
+
+async def handle_client(reader, writer):
+    # https://inter-static.skywatcher.com/downloads/synscanserialcommunicationprotocol_version33.pdf
+
+    try:
+        addr = writer.get_extra_info('peername')
+        print(f'Accepted connection from {addr}')
+
+        while True:
+            data = await reader.read(1)
+            if not data:
+                break
+
+            # Echo
+            if data == b'K':
+                extra = await reader.read(1)
+                writer.write(extra + b'#')
+
+            # Get version
+            elif data == b'V':
+                writer.write(b'060004#')
+
+            # Get model
+            elif data == b'm':
+                writer.write(b'2#')
+
+            # Get is aligned
+            elif data == b'J':
+                writer.write(b'\x01#')
+
+            # Various, see next char
+            elif data == b'P':
+                data = await reader.read(1)
+
+                # Get device
+                if data == b'\x01':
+                    data = await reader.read(6)
+                    if data[0] == 16:
+                        writer.write(b'\x03\x0f#')
+                    elif data[0] == 17:
+                        writer.write(b'\x03\x0f#')
+                    elif data[0] == 176:
+                        writer.write(b'\x6d\x32#')
+                    else:
+                        print(f'Unknown device {data[0]}')
+                        writer.write(b'#')
+
+                # Fixed slew
+                elif data == b'\x02':
+                    data = await reader.read(6)
+
+                    rate = data[2]
+                    if rate < 0 or rate > 9:
+                        print(f'Unexpected slew rate {rate}')
+                        break
+
+                    motion = False
+                    if rate > 0:
+                        # TODO check 1x, 2x, etc are standard properties in INDI, maybe switch to passing in a custom rate
+                        indi_set_bool('TELESCOPE_SLEW_RATE', f'{rate}x', True)
+                        motion = True
+
+                    if data[0] == 16:
+                        # east / right / positive / anticlockwise
+                        if data[1] == 36:
+                            indi_set_bool(f'TELESCOPE_MOTION_WE', 'MOTION_WEST' if args.reverse_ra else 'MOTION_EAST', motion)
+                        # west / left / negative / clockwise
+                        elif data[1] == 37:
+                            indi_set_bool(f'TELESCOPE_MOTION_WE', 'MOTION_EAST' if args.reverse_ra else 'MOTION_WEST', motion)
+                        else:
+                            print(f'Unknown direction {data[1]}')
+                    elif data[0] == 17:
+                        # north / up / positive / anticlockwise
+                        if data[1] == 36:
+                            indi_set_bool(f'TELESCOPE_MOTION_NS', 'MOTION_SOUTH' if args.reverse_dec else 'MOTION_NORTH', motion)
+                        # south / down / negative / clockwise
+                        elif data[1] == 37:
+                            indi_set_bool(f'TELESCOPE_MOTION_NS', 'MOTION_NORTH' if args.reverse_dec else 'MOTION_SOUTH', motion)
+                        else:
+                            print(f'Unknown direction {data[1]}')
+                    else:
+                        print(f'Unknown axis {data[0]}')
+                    writer.write(b'#')
+
+                else:
+                    print(f'Unknown command P{data}')
+                    writer.write(b'#')
+
+            # Get is tracking
+            elif data == b't':
+                tracking = b'\x02' if indi_state['tracking'] == 'Busy' else b'\x00'
+                writer.write(tracking + b'#')
+
+            # Get is going to
+            elif data == b'L':
+                doing_goto = b'1' if indi_state['doing_goto'] == 'Busy' else b'0'
+                writer.write(doing_goto + b'#')
+
+            # Cancel GOTO
+            elif data == b'M':
+                indi_set_bool('TELESCOPE_ABORT_MOTION', 'ABORT', True)
+                writer.write(b'#')
+
+            # Get precise RA/DEC
+            elif data == b'e':
+                coords = coords_to_hex(indi_state['ra'], indi_state['dec'])
+                writer.write(coords + b'#')
+
+            # GOTO precise RA/DEC
+            elif data == b'r':
+                data = await reader.read(17)
+                ra, dec = coords_to_decimal(data)
+                indi_set_bool('ON_COORD_SET', 'TRACK', True)
+                indi_state['writer'].write(f"""
+                    <newNumberVector device="{args.mount}" name="EQUATORIAL_EOD_COORD">
+                        <oneNumber name="RA">{ra}</oneNumber>
+                        <oneNumber name="DEC">{dec}</oneNumber>
+                    </newNumberVector>
+                """.encode('ascii'))
+                writer.write(b'#')
+
+            # SYNC precise RA/DEC
+            elif data == b's':
+                data = await reader.read(17)
+                ra, dec = coords_to_decimal(data)
+                indi_set_bool('ON_COORD_SET', 'SYNC', True)
+                indi_writer['writer'].write(f"""
+                    <newNumberVector device="{args.mount}" name="EQUATORIAL_EOD_COORD">
+                        <oneNumber name="RA">{ra}</oneNumber>
+                        <oneNumber name="DEC">{dec}</oneNumber>
+                    </newNumberVector>
+                """.encode('ascii'))
+                writer.write(b'#')
+
+            # Get location
+            elif data == b'w':
+                loc_str = loc_to_hex(indi_state['lat'], indi_state['long'])
+                writer.write(loc_str + b'#')
+
+            # Set location
+            elif data == b'W':
+                data = await reader.read(8)
+                lat, long = loc_to_decimal(data)
+                indi_state['writer'].write(f"""
+                    <newNumberVector device="{args.mount}" name="GEOGRAPHIC_COORD">
+                        <oneNumber name="LAT">{lat}</oneNumber>
+                        <oneNumber name="LONG">{long}</oneNumber>
+                        <oneNumber name="ELEV">100</oneNumber>
+                    </newNumberVector>
+                """.encode('ascii'))
+                writer.write(b'#')
+
+            # Get time
+            elif data == b'h':
+                # We cannot reliably get the time across various mount drivers, assume they are using this computers' time
+                now = datetime.now(timezone.utc)
+                time_str = bytes([now.hour, now.minute, now.second, now.month, now.day, now.year % 100, 0, 0])
+                writer.write(time_str + b'#')
+
+            # Set time
+            elif data == b'H':
+                data = await reader.read(8)
+                print(f'Asked to set time to {data}, ignoring')
+                writer.write(b'#')
+
+            else:
+                print(f'Unknown command {data}')
+                writer.write(b'#')
+    except Exception as e:
+        print(f'Error handling client connection "{e}"')
+    finally:
+        writer.close()
+
+
+async def start_server():
+    server = await asyncio.start_server(handle_client, args.host, args.port)
+    print(f'Listening on {args.host}:{args.port}')
+
+    async with server:
+        await server.serve_forever()
+
+
+async def main():
+    await asyncio.gather(
+        start_server(),
+        indi_connect()
+    )
+
+
+if __name__ == '__main__':
+    sys.stdout.reconfigure(line_buffering=True)
+
+    parser = argparse.ArgumentParser(description="Stellarium INDI Proxy")
+
+    parser.add_argument(
+        'mount',
+        help='The name of the mount to be controlled in INDI'
+    )
+    parser.add_argument(
+        '--reverse-ra',
+        action='store_true',
+        help='Reverse RA buttons so that pressing left increases the RA'
+    )
+    parser.add_argument(
+        '--reverse-dec',
+        action='store_true',
+        help='Reverse DEC buttons so that pressing down increases the DEC (or decreases when pier side east, pointing west)'
+    )
+    parser.add_argument(
+        '--host',
+        default='0.0.0.0',
+        help='Host to bind to (default: 127.0.0.1)'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=7625,
+        help='Port to listen on (default: 7625)'
+    )
+    parser.add_argument(
+        '--indi-host',
+        default='127.0.0.1',
+        help='INDI host (default: 127.0.0.1)'
+    )
+    parser.add_argument(
+        '--indi-port',
+        type=int,
+        default=7624,
+        help='INDI port (default: 7624)'
+    )
+
+    args = parser.parse_args()
+
+    asyncio.run(main())

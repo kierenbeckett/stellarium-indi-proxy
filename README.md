@@ -61,6 +61,13 @@ RestartSec=60
 WantedBy=multi-user.target
 ```
 
+Enable and start the service
+
+```
+systemctl enable stellarium-indi-proxy.service
+systemctl start stellarium-indi-proxy.service
+```
+
 ## FAQs
 
 ### Why is this needed, why not connect Stellarium directly to the mount?

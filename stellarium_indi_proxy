@@ -235,7 +235,7 @@ async def handle_client(reader, writer, mount, reverse_ra, reverse_dec):
                 data = await reader.read(17)
                 ra, dec = coords_to_decimal(data)
                 indi_set_bool(mount, 'ON_COORD_SET', 'SYNC', True)
-                indi_writer['writer'].write(f"""
+                indi_state['writer'].write(f"""
                     <newNumberVector device="{mount}" name="EQUATORIAL_EOD_COORD">
                         <oneNumber name="RA">{ra}</oneNumber>
                         <oneNumber name="DEC">{dec}</oneNumber>

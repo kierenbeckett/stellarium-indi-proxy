@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 
 indi_state = {}
 
-def indi_set_bool(name, attr, value):
+def indi_set_bool(mount, name, attr, value):
     indi_state['writer'].write(f"""
-        <newSwitchVector device="{args.mount}" name="{name}">
+        <newSwitchVector device="{mount}" name="{name}">
             <oneSwitch name="{attr}">{'On' if value else 'Off'}</oneSwitch>
         </newSwitchVector>
     """.encode('ascii'))
@@ -59,15 +59,15 @@ def loc_to_hex(lat, long):
     ])
 
 
-async def indi_connect():
+async def indi_connect(host, port, mount):
     while True:
         writer = None
         try:
-            print(f'Connecting to INDI at {args.indi_host}:{args.indi_port}...')
-            reader, writer = await asyncio.open_connection(args.indi_host, args.indi_port)
-            print(f'Connected to INDI, getting properties for {args.mount}')
+            print(f'Connecting to INDI at {host}:{port}...')
+            reader, writer = await asyncio.open_connection(host, port)
+            print(f'Connected to INDI, getting properties for {mount}')
             indi_state['writer'] = writer
-            writer.write(f'<getProperties version="1.7" device="{args.mount}" />'.encode('ascii'))
+            writer.write(f'<getProperties version="1.7" device="{mount}" />'.encode('ascii'))
 
             parser = ET.XMLPullParser(events=['start', 'end'])
             root_element = None
@@ -110,7 +110,7 @@ async def indi_connect():
         await asyncio.sleep(60)
 
 
-async def handle_client(reader, writer):
+async def handle_client(reader, writer, mount, reverse_ra, reverse_dec):
     # https://inter-static.skywatcher.com/downloads/synscanserialcommunicationprotocol_version33.pdf
 
     try:
@@ -168,25 +168,25 @@ async def handle_client(reader, writer):
                     motion = False
                     if rate > 0:
                         # TODO check 1x, 2x, etc are standard properties in INDI, maybe switch to passing in a custom rate
-                        indi_set_bool('TELESCOPE_SLEW_RATE', f'{rate}x', True)
+                        indi_set_bool(mount, 'TELESCOPE_SLEW_RATE', f'{rate}x', True)
                         motion = True
 
                     if data[0] == 16:
                         # east / right / positive / anticlockwise
                         if data[1] == 36:
-                            indi_set_bool(f'TELESCOPE_MOTION_WE', 'MOTION_WEST' if args.reverse_ra else 'MOTION_EAST', motion)
+                            indi_set_bool(mount, f'TELESCOPE_MOTION_WE', 'MOTION_WEST' if reverse_ra else 'MOTION_EAST', motion)
                         # west / left / negative / clockwise
                         elif data[1] == 37:
-                            indi_set_bool(f'TELESCOPE_MOTION_WE', 'MOTION_EAST' if args.reverse_ra else 'MOTION_WEST', motion)
+                            indi_set_bool(mount, f'TELESCOPE_MOTION_WE', 'MOTION_EAST' if reverse_ra else 'MOTION_WEST', motion)
                         else:
                             print(f'Unknown direction {data[1]}')
                     elif data[0] == 17:
                         # north / up / positive / anticlockwise
                         if data[1] == 36:
-                            indi_set_bool(f'TELESCOPE_MOTION_NS', 'MOTION_SOUTH' if args.reverse_dec else 'MOTION_NORTH', motion)
+                            indi_set_bool(mount, f'TELESCOPE_MOTION_NS', 'MOTION_SOUTH' if reverse_dec else 'MOTION_NORTH', motion)
                         # south / down / negative / clockwise
                         elif data[1] == 37:
-                            indi_set_bool(f'TELESCOPE_MOTION_NS', 'MOTION_NORTH' if args.reverse_dec else 'MOTION_SOUTH', motion)
+                            indi_set_bool(mount, f'TELESCOPE_MOTION_NS', 'MOTION_NORTH' if reverse_dec else 'MOTION_SOUTH', motion)
                         else:
                             print(f'Unknown direction {data[1]}')
                     else:
@@ -209,7 +209,7 @@ async def handle_client(reader, writer):
 
             # Cancel GOTO
             elif data == b'M':
-                indi_set_bool('TELESCOPE_ABORT_MOTION', 'ABORT', True)
+                indi_set_bool(mount, 'TELESCOPE_ABORT_MOTION', 'ABORT', True)
                 writer.write(b'#')
 
             # Get precise RA/DEC
@@ -221,9 +221,9 @@ async def handle_client(reader, writer):
             elif data == b'r':
                 data = await reader.read(17)
                 ra, dec = coords_to_decimal(data)
-                indi_set_bool('ON_COORD_SET', 'TRACK', True)
+                indi_set_bool(mount, 'ON_COORD_SET', 'TRACK', True)
                 indi_state['writer'].write(f"""
-                    <newNumberVector device="{args.mount}" name="EQUATORIAL_EOD_COORD">
+                    <newNumberVector device="{mount}" name="EQUATORIAL_EOD_COORD">
                         <oneNumber name="RA">{ra}</oneNumber>
                         <oneNumber name="DEC">{dec}</oneNumber>
                     </newNumberVector>
@@ -234,9 +234,9 @@ async def handle_client(reader, writer):
             elif data == b's':
                 data = await reader.read(17)
                 ra, dec = coords_to_decimal(data)
-                indi_set_bool('ON_COORD_SET', 'SYNC', True)
+                indi_set_bool(mount, 'ON_COORD_SET', 'SYNC', True)
                 indi_writer['writer'].write(f"""
-                    <newNumberVector device="{args.mount}" name="EQUATORIAL_EOD_COORD">
+                    <newNumberVector device="{mount}" name="EQUATORIAL_EOD_COORD">
                         <oneNumber name="RA">{ra}</oneNumber>
                         <oneNumber name="DEC">{dec}</oneNumber>
                     </newNumberVector>
@@ -253,7 +253,7 @@ async def handle_client(reader, writer):
                 data = await reader.read(8)
                 lat, long = loc_to_decimal(data)
                 indi_state['writer'].write(f"""
-                    <newNumberVector device="{args.mount}" name="GEOGRAPHIC_COORD">
+                    <newNumberVector device="{mount}" name="GEOGRAPHIC_COORD">
                         <oneNumber name="LAT">{lat}</oneNumber>
                         <oneNumber name="LONG">{long}</oneNumber>
                         <oneNumber name="ELEV">100</oneNumber>
@@ -283,18 +283,18 @@ async def handle_client(reader, writer):
         writer.close()
 
 
-async def start_server():
-    server = await asyncio.start_server(handle_client, args.host, args.port)
-    print(f'Listening on {args.host}:{args.port}')
+async def start_server(host, port, mount, reverse_ra, reverse_dec):
+    server = await asyncio.start_server(lambda reader, writer: handle_client(reader, writer, mount, reverse_ra, reverse_dec), host, port)
+    print(f'Listening on {host}:{port}')
 
     async with server:
         await server.serve_forever()
 
 
-async def main():
+async def main(args):
     await asyncio.gather(
-        start_server(),
-        indi_connect()
+        start_server(args.host, args.port, args.mount, args.reverse_ra, args.reverse_dec),
+        indi_connect(args.indi_host, args.indi_port, args.mount)
     )
 
 
@@ -340,6 +340,4 @@ if __name__ == '__main__':
         help='INDI port (default: 7624)'
     )
 
-    args = parser.parse_args()
-
-    asyncio.run(main())
+    asyncio.run(main(parser.parse_args()))

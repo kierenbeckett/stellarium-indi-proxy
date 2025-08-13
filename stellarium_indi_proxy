@@ -67,6 +67,7 @@ async def indi_connect(host, port, mount):
             reader, writer = await asyncio.open_connection(host, port)
             print(f'Connected to INDI, getting properties for {mount}')
             indi_state['writer'] = writer
+            indi_set_bool(mount, 'CONNECTION', 'CONNECT', True)
             writer.write(f'<getProperties version="1.7" device="{mount}" />'.encode('ascii'))
 
             parser = ET.XMLPullParser(events=['start', 'end'])
